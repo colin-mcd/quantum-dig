@@ -11,9 +11,12 @@ def circuit_to_dag(circ):
     return Q.converters.circuit_to_dag(circ)
 
 def circuit_to_dep_graph(circ):
-    return dag_to_dep_graph(circuit_to_dag(circ), lambda x: circ.find_bit(x)[0])
+    return dag_to_dep_graph(circuit_to_dag(circ), circuit_find_qubit_dict(circ))
 
-def reachable(dag, gai, gbi):
+def circuit_find_qubit_dict(circ):
+    return {x: circ.find_bit(x)[0] for x in circ.qubits}
+
+def reachable(graph, gai, gbi):
     frontier = {gai}
     checked = set()
     #print(gai, gbi)
@@ -23,7 +26,7 @@ def reachable(dag, gai, gbi):
         if gi == gbi:
             return True
         else:
-            for gj in dag._multi_graph.successors(gi):
+            for gj in graph.successors(gi):
                 if gj._node_id not in checked:
                     frontier.add(gj._node_id)
     return False
@@ -37,13 +40,10 @@ def trim_edges(dag):
 
     todo = set()
     if isinstance(dag, Q.dagcircuit.DAGDependency):
-        #print(dag.get_all_edges())
         todo = set((ga, gb) for ga, gb, _ in dag.get_all_edges())
     else:
         todo = set((get_id(ga), get_id(gb)) for (ga, gb, qi) in dag.edges())
 
-    #edges = dag.get_all_edges() if isinstance(dag, Q.dagcircuit.DAGDependency) else dag.edges()
-    #todo = set((ga._node_id, gb._node_id, qi) for (ga, gb, qi) in edges)
     while todo:
         edge = todo.pop()
         gai, gbi = edge
@@ -51,65 +51,16 @@ def trim_edges(dag):
         for gci in dag._multi_graph.successors(gai):
             if get_id(gci) == gbi:
                 dup_edges += 1
-        if dup_edges > 1:
-            print(f"Dup edges!: {dup_edges}")
-        if any(reachable(dag, get_id(gci), gbi) and gbi != get_id(gci) for gci in dag._multi_graph.successors(gai)):
+        if any(reachable(dag._multi_graph, get_id(gci), gbi) and gbi != get_id(gci) for gci in dag._multi_graph.successors(gai)):
             dag._multi_graph.remove_edge(gai, gbi)
 
 def is_op_node(node):
     return isinstance(node, Q.dagcircuit.DAGOpNode)
 
-class EdgeGraph:
-    
-    def __init__(self, nodes=(), edges=()):
-        self.nodes = list(nodes)
-        self.adj_matrix = [[None for _ in nodes] for _ in nodes]
-        for fm_idx, to_idx, w in edges:
-            self.adj_matrix[fm_idx][to_idx] = w
-    
-    def get_edge(self, fm_idx, to_idx):
-        return self.adj_matrix[fm_idx][to_idx]
-
-    def __getitem__(self, key):
-        fm_idx, to_idx = key
-        return self.get_edge(fm_idx, to_idx)
-
-    def __setitem__(self, key, val):
-        fm_idx, to_idx = key
-        self.adj_matrix[fm_idx][to_idx] = val
-
-    def __iadd__(self, key, val):
-        fm_idx, to_idx = key
-        self.adj_matrix[fm_idx][to_idx] += val
-
-    def __isub__(self, key, val):
-        fm_idx, to_idx = key
-        self.adj_matrix[fm_idx][to_idx] -= val
-
-    def __delitem__(self, key):
-        fm_idx, to_idx = key
-        self.adj_matrix[fm_idx][to_idx] = None
-
-    def __iter__(self):
-        return ((fm_idx, to_idx, w) \
-                for fm_idx, row in enumerate(self.adj_matrix) \
-                for to_idx, w in enumerate(row) \
-                if w)
-
-    def in_edges(self, idx):
-        return ((fm_idx, idx, row[idx]) \
-                for fm_idx, row in enumerate(self.adj_matrix) \
-                if row[idx])
-
-    def out_edges(self, idx):
-        return ((idx, to_idx, w) \
-                for to_idx, w in enumerate(self.adj_matrix[idx]) \
-                if w)
-
 import rustworkx as rx
-import cProfile
+#import cProfile
 
-def dag_to_dep_graph(dag, find_bit_fn):
+def dag_to_dep_graph(dag, find_qubit):
     graph = rx.PyDAG(multigraph=False)
     graph.add_nodes_from(dag._multi_graph.nodes())
     todo = set()
@@ -133,17 +84,17 @@ def dag_to_dep_graph(dag, find_bit_fn):
         opto = is_op_node(gto)
         
         if opfm and opto:
-            shared = any(find_bit_fn(q1) == find_bit_fn(q2)
+            shared = any(find_qubit[q1] == find_qubit[q2]
                          for q1 in gfm.qargs for q2 in gto.qargs)
             if shared and (ifm, ito) not in todo \
                and (ifm, ito) not in visited:
                 graph.add_edge(ifm, ito, None)
                 todo.add((ifm, ito))
         elif opfm:
-            if any(find_bit_fn(q) == find_bit_fn(gto.wire) for q in gfm.qargs):
+            if any(find_qubit[q] == find_qubit[gto.wire] for q in gfm.qargs):
                 graph.add_edge(ifm, ito, None)
         elif opto:
-            if any(find_bit_fn(q) == find_bit_fn(gfm.wire) for q in gto.qargs):
+            if any(find_qubit[q] == find_qubit[gfm.wire] for q in gto.qargs):
                 graph.add_edge(ifm, ito, None)
         else:
             if gfm.wire == gto.wire:
@@ -154,7 +105,7 @@ def dag_to_dep_graph(dag, find_bit_fn):
         visited.add((gai, gbi))
         ga = graph.get_node_data(gai)
         gb = graph.get_node_data(gbi)
-        if commutes(ga, gb, find_bit_fn):
+        if commutes(ga, gb, find_qubit):
             graph.remove_edge(gai, gbi)
             # Propagate in-edges
             for pidx, _, _ in graph.in_edges(gai):
@@ -165,20 +116,14 @@ def dag_to_dep_graph(dag, find_bit_fn):
     dag._multi_graph = graph
     return dag
 
-#def is_sq_pow2(mtx):
-#    return len(mtx.shape) == 2 and \
-#           mtx.shape[0] == mtx.shape[1] and \
-#           mtx.shape[0].bit_count() == 1
-
 def as_bits(n, nbits=None):
     "Converts an integer into its bit representation"
     return [int(bool(n & (1 << (i - 1)))) for i in range(nbits or n.bit_length(), 0, -1)]
 
-def rearrange_gate2(mat, old, new):
+def rearrange_gate(mat, old, new):
     """
     Rearranges a gate's unitary matrix for application to a new set of qubits.
     Assumes set(old) = set(new).
-    Then you can multiply a gate @ rearrange_gate(...) to get the rearranged unitary.
     """
     old = list(reversed(old))
     new = list(reversed(new))
@@ -207,16 +152,14 @@ def rearrange_gate2(mat, old, new):
         mat2[:, i] = mat1[:, reordered[i]]
     return mat2
 
-def align_gates(ga, gb, find_bit_fn):
+def align_gates(ga, gb, find_qubit):
     """
     Aligns gates along the same qubits, returning a tuple of their new unitaries
     """
     ma = ga.op.to_matrix()
     mb = gb.op.to_matrix()
-    #qas = [qi.index for qi in ga.qargs]
-    #qbs = [qi.index for qi in gb.qargs]
-    qas = [find_bit_fn(qi) for qi in ga.qargs]
-    qbs = [find_bit_fn(qi) for qi in gb.qargs]
+    qas = [find_qubit[qi] for qi in ga.qargs]
+    qbs = [find_qubit[qi] for qi in gb.qargs]
     qas_ins = list(set(qbs) - set(qas))
     qbs_ins = list(set(qas) - set(qbs))
     qas2 = qas + qas_ins
@@ -226,14 +169,12 @@ def align_gates(ga, gb, find_bit_fn):
     # Add additional qubits from ga
     mb2 = np.kron(np.identity(1 << len(qbs_ins), dtype=mb.dtype), mb)
     # Rearrange mb2 to match ma2's qubit order
-    mb3 = rearrange_gate2(mb2, qbs2, qas2)
+    mb3 = rearrange_gate(mb2, qbs2, qas2)
     return (ma2, mb3)
 
-
-def commutes(ga, gb, find_bit_fn):
-    ma, mb = align_gates(ga, gb, find_bit_fn)
+def commutes(ga, gb, find_qubit):
+    ma, mb = align_gates(ga, gb, find_qubit)
     return (np.abs((ma @ mb) - (mb @ ma)) < EPS).all()
-
 
 def read_qasm(qasm_file):
     acc = []
@@ -261,13 +202,13 @@ def main(argv):
         print(f"Original DAG: {orig_depth - 1} depth, {orig_edges} edges")
 
         my_start = time.time()
-        my_dep = dag_to_dep_graph(my_dag, lambda x: circuit.find_bit(x)[0])
+        my_dep = dag_to_dep_graph(my_dag, circuit_find_qubit_dict(circuit))
         my_end = time.time()
 
         #trim_edges(my_dep)
         #untrimmed_edges = my_dep.edges()
         print(f"My dependency graph: {my_dep.depth() - 1} depth, {op_edges(my_dep)} edges, {my_end - my_start:0.4f} sec")
-        return None
+        #return None
         # Possible buggy difference between dag2dagdep and circ2dagdep...?
         qk_start = time.time()
         qk_dep = Q.converters.dag_to_dagdependency(qk_dag)
@@ -280,5 +221,5 @@ def main(argv):
         print("Pass a .qasm file as arg", out=sys.stderr)
 
 if __name__ == '__main__':
-    cProfile.run('main(sys.argv)')
-    #main(sys.argv)
+    #cProfile.run('main(sys.argv)')
+    main(sys.argv)
