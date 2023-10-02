@@ -1,48 +1,21 @@
 import qiskit as Q
 import sys
 import numpy as np
+import rustworkx as rx
+#import cProfile
 
 EPS = 1e-10
-
-#def log2(n):
-#    return n.bit_length() - 1
 
 def circuit_to_dag(circ):
     return Q.converters.circuit_to_dag(circ)
 
 def circuit_to_dep_graph(circ):
-    return dag_to_dep_graph(circuit_to_dag(circ), circuit_find_qubit_dict(circ))
+    dag = circuit_to_dag(circ)
+    dag._multi_graph = dag_to_dep_graph(dag._multi_graph, circuit_find_qubit_dict(circ))
+    return dag
 
 def circuit_find_qubit_dict(circ):
     return {x: circ.find_bit(x)[0] for x in circ.qubits}
-
-# def reachable(graph, gai, gbi):
-#     frontier = {gai}
-#     checked = set()
-#     while frontier:
-#         gi = frontier.pop()
-#         checked.add(gi)
-#         if gi == gbi:
-#             return True
-#         else:
-#             for gj in graph.successors(gi):
-#                 if gj._node_id not in checked:
-#                     frontier.add(gj._node_id)
-#     return False
-
-# def reachability(dag):
-#     "Returns a mapping from nodes to sets of nodes reachable from them"
-#     reaches = dict()
-#     def visit(node):
-#         nodes = {node}
-#         reaches[node] = nodes
-#         for _, to, _ in dag.out_edges(node):
-#             if to not in reaches:
-#                 visit(to)
-#             nodes |= reaches[to]
-#     for node in dag.node_indices():
-#         visit(node)
-#     return reaches
 
 def indirect_reachability(dag):
     "Returns a mapping from nodes to sets of nodes reachable from them, via 2 or more edges"
@@ -59,7 +32,6 @@ def indirect_reachability(dag):
         visit(node)
     return reaches
 
-
 def trim_edges(dag):
     todo = set(dag.edge_list())
     indirect_reaches = indirect_reachability(dag)
@@ -74,21 +46,19 @@ def trim_edges(dag):
         edge = todo.pop()
         gai, gbi = edge
         if any(gbi in indirect_reaches[get_id(gci)] and gbi != get_id(gci) for gci in dag.successors(gai)):
-        #if any(reachable(dag, get_id(gci), gbi) and gbi != get_id(gci) for gci in dag.successors(gai)):
             dag.remove_edge(gai, gbi)
 
 def is_op_node(node):
     return isinstance(node, Q.dagcircuit.DAGOpNode)
 
-import rustworkx as rx
-#import cProfile
-
 def dag_to_dep_graph(dag, find_qubit, trim=False):
+    assert isinstance(dag, rx.PyDAG), \
+        f"dag_to_dep_graph expected a DAG of type rustworkx.PyDAG, but got {type(dag)} instead"
     graph = rx.PyDAG(multigraph=False)
-    graph.add_nodes_from(dag._multi_graph.nodes())
-    reaches = {i: {i} for i in dag._multi_graph.node_indices()}
+    graph.add_nodes_from(dag.nodes())
+    reaches = {i: {i} for i in dag.node_indices()}
     todo = set()
-    for gai, gbi, qi in dag._multi_graph.weighted_edge_list():
+    for gai, gbi, qi in dag.weighted_edge_list():
         graph.add_edge(gai, gbi, None)
         if is_op_node(graph.get_node_data(gai)) and is_op_node(graph.get_node_data(gbi)):
             todo.add((gai, gbi))
@@ -115,15 +85,10 @@ def dag_to_dep_graph(dag, find_qubit, trim=False):
                and (not trim or ito not in reaches[ifm]):
                 graph.add_edge(ifm, ito, None)
                 todo.add((ifm, ito))
-        elif opfm:
-            if any(find_qubit[q] == find_qubit[gto.wire] for q in gfm.qargs):
-                graph.add_edge(ifm, ito, None)
-        elif opto:
-            if any(find_qubit[q] == find_qubit[gfm.wire] for q in gto.qargs):
-                graph.add_edge(ifm, ito, None)
-        else:
-            if gfm.wire == gto.wire:
-                graph.add_edge(ifm, ito, None)
+        elif (opfm and any(find_qubit[q] == find_qubit[gto.wire] for q in gfm.qargs)) or \
+             (opto and any(find_qubit[q] == find_qubit[gfm.wire] for q in gto.qargs)) or \
+             (not opfm and not opto and gfm.wire == gto.wire):
+            graph.add_edge(ifm, ito, None)
 
     while todo:
         gai, gbi = todo.pop()
@@ -140,8 +105,7 @@ def dag_to_dep_graph(dag, find_qubit, trim=False):
                 maybe_push_edge(gai, cidx, ga, graph.get_node_data(cidx))
         elif trim:
             reaches[gai] |= reaches[gbi]
-    dag._multi_graph = graph
-    return dag
+    return graph
 
 def as_bits(n, nbits=None):
     "Converts an integer into its bit representation"
@@ -222,15 +186,15 @@ def op_edges(g):
 def main(argv):
     if len(argv) == 2:
         circuit = read_qasm(argv[1])
-        my_dag = circuit_to_dag(circuit)
+        my_dep = circuit_to_dag(circuit)
         qk_dag = circuit_to_dag(circuit)
-        orig_depth = my_dag.depth()
-        orig_edges = glen(my_dag.edges())
+        orig_depth = my_dep.depth()
+        orig_edges = glen(my_dep.edges())
         print(f"Original DAG: {orig_depth - 1} depth, {orig_edges} edges")
 
         TRIM = False
         my_start = time.time()
-        my_dep = dag_to_dep_graph(my_dag, circuit_find_qubit_dict(circuit), TRIM)
+        my_dep._multi_graph = dag_to_dep_graph(my_dep._multi_graph, circuit_find_qubit_dict(circuit), TRIM)
         my_end = time.time()
 
         if TRIM:
