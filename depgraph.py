@@ -4,8 +4,8 @@ import numpy as np
 
 EPS = 1e-10
 
-def log2(n):
-    return n.bit_length() - 1
+#def log2(n):
+#    return n.bit_length() - 1
 
 def circuit_to_dag(circ):
     return Q.converters.circuit_to_dag(circ)
@@ -16,43 +16,66 @@ def circuit_to_dep_graph(circ):
 def circuit_find_qubit_dict(circ):
     return {x: circ.find_bit(x)[0] for x in circ.qubits}
 
-def reachable(graph, gai, gbi):
-    frontier = {gai}
-    checked = set()
-    #print(gai, gbi)
-    while frontier:
-        gi = frontier.pop()
-        checked.add(gi)
-        if gi == gbi:
-            return True
-        else:
-            for gj in graph.successors(gi):
-                if gj._node_id not in checked:
-                    frontier.add(gj._node_id)
-    return False
+# def reachable(graph, gai, gbi):
+#     frontier = {gai}
+#     checked = set()
+#     while frontier:
+#         gi = frontier.pop()
+#         checked.add(gi)
+#         if gi == gbi:
+#             return True
+#         else:
+#             for gj in graph.successors(gi):
+#                 if gj._node_id not in checked:
+#                     frontier.add(gj._node_id)
+#     return False
+
+# def reachability(dag):
+#     "Returns a mapping from nodes to sets of nodes reachable from them"
+#     reaches = dict()
+#     def visit(node):
+#         nodes = {node}
+#         reaches[node] = nodes
+#         for _, to, _ in dag.out_edges(node):
+#             if to not in reaches:
+#                 visit(to)
+#             nodes |= reaches[to]
+#     for node in dag.node_indices():
+#         visit(node)
+#     return reaches
+
+def indirect_reachability(dag):
+    "Returns a mapping from nodes to sets of nodes reachable from them, via 2 or more edges"
+    reaches = dict()
+    def visit(node):
+        nodes = {node}
+        reaches[node] = nodes
+        outs = dag.out_edges(node)
+        for _, to, _ in outs:
+            if to not in reaches:
+                visit(to)
+            nodes |= reaches[to] | ({i for _, i, _ in dag.out_edges(to)} - set(outs))
+    for node in dag.node_indices():
+        visit(node)
+    return reaches
+
 
 def trim_edges(dag):
+    todo = set(dag.edge_list())
+    indirect_reaches = indirect_reachability(dag)
+
     def get_id(node):
         if '_node_id' in dir(node):
             return node._node_id
         elif 'node_id' in dir(node):
             return node.node_id
-
-    todo = set()
-    if isinstance(dag, Q.dagcircuit.DAGDependency):
-        todo = set((ga, gb) for ga, gb, _ in dag.get_all_edges())
-    else:
-        todo = set((get_id(ga), get_id(gb)) for (ga, gb, qi) in dag.edges())
-
+    
     while todo:
         edge = todo.pop()
         gai, gbi = edge
-        dup_edges = 0
-        for gci in dag._multi_graph.successors(gai):
-            if get_id(gci) == gbi:
-                dup_edges += 1
-        if any(reachable(dag._multi_graph, get_id(gci), gbi) and gbi != get_id(gci) for gci in dag._multi_graph.successors(gai)):
-            dag._multi_graph.remove_edge(gai, gbi)
+        if any(gbi in indirect_reaches[get_id(gci)] and gbi != get_id(gci) for gci in dag.successors(gai)):
+        #if any(reachable(dag, get_id(gci), gbi) and gbi != get_id(gci) for gci in dag.successors(gai)):
+            dag.remove_edge(gai, gbi)
 
 def is_op_node(node):
     return isinstance(node, Q.dagcircuit.DAGOpNode)
@@ -60,9 +83,10 @@ def is_op_node(node):
 import rustworkx as rx
 #import cProfile
 
-def dag_to_dep_graph(dag, find_qubit):
+def dag_to_dep_graph(dag, find_qubit, trim=False):
     graph = rx.PyDAG(multigraph=False)
     graph.add_nodes_from(dag._multi_graph.nodes())
+    reaches = {i: {i} for i in dag._multi_graph.node_indices()}
     todo = set()
     for gai, gbi, qi in dag._multi_graph.weighted_edge_list():
         graph.add_edge(gai, gbi, None)
@@ -87,7 +111,8 @@ def dag_to_dep_graph(dag, find_qubit):
             shared = any(find_qubit[q1] == find_qubit[q2]
                          for q1 in gfm.qargs for q2 in gto.qargs)
             if shared and (ifm, ito) not in todo \
-               and (ifm, ito) not in visited:
+               and (ifm, ito) not in visited \
+               and (not trim or ito not in reaches[ifm]):
                 graph.add_edge(ifm, ito, None)
                 todo.add((ifm, ito))
         elif opfm:
@@ -113,6 +138,8 @@ def dag_to_dep_graph(dag, find_qubit):
             # Propagate out-edges
             for _, cidx, _ in graph.out_edges(gbi):
                 maybe_push_edge(gai, cidx, ga, graph.get_node_data(cidx))
+        elif trim:
+            reaches[gai] |= reaches[gbi]
     dag._multi_graph = graph
     return dag
 
@@ -201,20 +228,21 @@ def main(argv):
         orig_edges = glen(my_dag.edges())
         print(f"Original DAG: {orig_depth - 1} depth, {orig_edges} edges")
 
+        TRIM = False
         my_start = time.time()
-        my_dep = dag_to_dep_graph(my_dag, circuit_find_qubit_dict(circuit))
+        my_dep = dag_to_dep_graph(my_dag, circuit_find_qubit_dict(circuit), TRIM)
         my_end = time.time()
 
-        #trim_edges(my_dep)
-        #untrimmed_edges = my_dep.edges()
-        print(f"My dependency graph: {my_dep.depth() - 1} depth, {op_edges(my_dep)} edges, {my_end - my_start:0.4f} sec")
-        #return None
-        # Possible buggy difference between dag2dagdep and circ2dagdep...?
+        if TRIM:
+            trim_start = time.time()
+            trim_edges(my_dep._multi_graph)
+            trim_end = time.time()
+            print(f"My dependency graph: {my_dep.depth() - 1} depth, {op_edges(my_dep)} edges, {my_end - my_start:0.4f} sec + trimming for {trim_end - trim_start:0.4f} sec")
+        else:
+            print(f"My dependency graph: {my_dep.depth() - 1} depth, {op_edges(my_dep)} edges, {my_end - my_start:0.4f} sec")
         qk_start = time.time()
         qk_dep = Q.converters.dag_to_dagdependency(qk_dag)
         qk_end = time.time()
-
-        #trim_edges(qk_dep)
 
         print(f"Qiskit dependency graph: {qk_dep.depth()} depth, {glen(qk_dep.get_all_edges())} edges, {qk_end - qk_start:0.4f} sec")
     else:
