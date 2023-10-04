@@ -1,8 +1,15 @@
 import qiskit as Q
-import sys
-import numpy as np
 import rustworkx as rx
-#import cProfile
+import numpy as np
+import sys
+import json
+
+#import scipy
+#def cluster(dag):
+#    adjmtx = rx.adjacency_matrix(dag)
+#    adjid = np.identity(adjmtx.shape[0])
+#    whitened = scipy.cluster.vq.whiten(adjmtx + adjid)
+#    return scipy.cluster.vq.kmeans2(whitened, adjmtx.shape[0]//2, minit='points')[1]
 
 EPS = 1e-10
 
@@ -163,55 +170,145 @@ def align_gates(ga, gb, find_qubit):
     mb3 = rearrange_gate(mb2, qbs2, qas2)
     return (ma2, mb3)
 
-def commutes(ga, gb, find_qubit):
-    ma, mb = align_gates(ga, gb, find_qubit)
-    return (np.abs((ma @ mb) - (mb @ ma)) < EPS).all()
+def hardcoded_commutes(ga, gb, find_qubit):
+    "Returns 0 if N/A, 1 if commute, 2 if dependent"
+    NA, COMMUTE, DEPENDENT = 0, 1, 2
+    gan, gbn = ga.op.name, gb.op.name
+    qas, qbs = [find_qubit[q] for q in ga.qargs], [find_qubit[q] for q in gb.qargs]
 
-def read_qasm(qasm_file):
+    def comm(gan, gbn, qas, qbs):
+        if gan == 'cx' and gbn in ['x', 'sx', 'rx']:
+            return qas[1] == qbs[0]
+        elif gan == 'cx' and gbn in ['z', 'rz']:
+            return qas[0] == qbs[0]
+        elif gan == 'cx' and gbn == 'cx':
+            return qas[0] != qbs[1] and qas[1] != qbs[0]
+        elif gan == 'ccx' and gbn == 'cx':
+            return qas[2] != qbs[0] and qbs[1] not in qas[:2]
+        elif gan == 'ccx' and gbn == 'ccx':
+            return qas[2] not in qbs[:2] and qbs[2] not in qas[:2]
+        elif gan == 'ccx' and gbn in ['x', 'sx', 'rx']:
+            return qbs[0] not in qas[:2]
+        elif gan == 'ccx' and gbn in ['z', 'rz']:
+            return qbs[0] in qas[:2]
+
+    if gan == gbn and qas == qbs:
+        return COMMUTE
+    else:
+        c = comm(gan, gbn, qas, qbs)
+        return NA if c is None else 2 - c
+
+def commutes(ga, gb, find_qubit):
+    hc = hardcoded_commutes(ga, gb, find_qubit) or hardcoded_commutes(gb, ga, find_qubit)
+    if hc == 0: # we don't have this case in the hardcoded rules
+        ma, mb = align_gates(ga, gb, find_qubit)
+        return (np.abs((ma @ mb) - (mb @ ma)) < EPS).all()
+    return bool(hc % 2) # we've have this case in the hardcoded rules
+
+def read_qasm(fh):
     acc = []
-    with open(qasm_file, 'r') as fh:
-        for line in fh:
-            if not line.startswith('//'):
-                acc.append(line)
+    for line in fh:
+        if not line.startswith('//'):
+            acc.append(line)
     return Q.QuantumCircuit.from_qasm_str(''.join(acc))
 
-def glen(generator):
-    return sum(1 for _ in generator)
+def write_dep_graph(graph, find_qubit, fh):
+    nodemap = dict()
+    numnodes = 0
+    nodes = []
+    edges = []
+    for node in graph.node_indices():
+        data = graph.get_node_data(node)
+        if is_op_node(data):
+            nodemap[node] = numnodes
+            numnodes += 1
+            nodes.append(data)
+    for fm, to in graph.edge_list():
+        if is_op_node(graph.get_node_data(fm)) and is_op_node(graph.get_node_data(to)):
+            edges.append((nodemap[fm], nodemap[to]))
+    
+    # TODO: handle cargs
+    node_data = []
+    for node in nodes:
+        if node.op.params:
+            node_data.append({
+                'name': node.op.name,
+                'params': node.op.params,
+                'qargs': [find_qubit[qarg] for qarg in node.qargs],
+                #'cargs': [f'{}' for carg in node.cargs]
+            })
+        else:
+            node_data.append({
+                'name': node.op.name,
+                'qargs': [find_qubit[qarg] for qarg in node.qargs],
+                #'cargs': [f'{}' for carg in node.cargs]
+            })
+    data = {'nodes': node_data, 'edges': edges}
+    json.dump(data, fh)
+    
 
-import time
-
-def op_edges(g):
-    return glen(filter(lambda e: isinstance(e[0], Q.dagcircuit.DAGOpNode) and isinstance(e[1], Q.dagcircuit.DAGOpNode), g.edges()))
+def usage(argv):
+    return f"""
+Usage:
+    {argv[0]} [input.qasm] [output.json]
+If either arg is omitted, read from stdin/stdout
+"""
 
 def main(argv):
     if len(argv) == 2:
-        circuit = read_qasm(argv[1])
-        my_dep = circuit_to_dag(circuit)
-        qk_dag = circuit_to_dag(circuit)
-        orig_depth = my_dep.depth()
-        orig_edges = glen(my_dep.edges())
-        print(f"Original DAG: {orig_depth - 1} depth, {orig_edges} edges")
-
-        TRIM = False
-        my_start = time.time()
-        my_dep._multi_graph = dag_to_dep_graph(my_dep._multi_graph, circuit_find_qubit_dict(circuit), TRIM)
-        my_end = time.time()
-
-        if TRIM:
-            trim_start = time.time()
-            trim_edges(my_dep._multi_graph)
-            trim_end = time.time()
-            print(f"My dependency graph: {my_dep.depth() - 1} depth, {op_edges(my_dep)} edges, {my_end - my_start:0.4f} sec + trimming for {trim_end - trim_start:0.4f} sec")
-        else:
-            print(f"My dependency graph: {my_dep.depth() - 1} depth, {op_edges(my_dep)} edges, {my_end - my_start:0.4f} sec")
-        qk_start = time.time()
-        qk_dep = Q.converters.dag_to_dagdependency(qk_dag)
-        qk_end = time.time()
-
-        print(f"Qiskit dependency graph: {qk_dep.depth()} depth, {glen(qk_dep.get_all_edges())} edges, {qk_end - qk_start:0.4f} sec")
+        ifh = open(argv[1])
+        ofh = sys.stdout
+    elif len(argv) == 3:
+        ifh = open(argv[1])
+        ofh = open(argv[2], 'w')
     else:
-        print("Pass a .qasm file as arg", out=sys.stderr)
+        print(usage.strip(), file=sys.stderr)
+        return 1
+
+    circuit = read_qasm(ifh)
+    dag = circuit_to_dag(circuit)
+    find_qubit = circuit_find_qubit_dict(circuit)
+    dg = dag_to_dep_graph(dag._multi_graph, find_qubit, trim=True)
+    trim_edges(dg)
+    write_dep_graph(dg, find_qubit, ofh)
+
+# def glen(generator):
+#     return sum(1 for _ in generator)
+
+# import time
+
+# def op_edges(g):
+#     return glen(filter(lambda e: isinstance(e[0], Q.dagcircuit.DAGOpNode) and isinstance(e[1], Q.dagcircuit.DAGOpNode), g.edges()))
+
+# def main(argv):
+#     if len(argv) == 2:
+#         circuit = read_qasm(argv[1])
+#         my_dep = circuit_to_dag(circuit)
+#         qk_dag = circuit_to_dag(circuit)
+#         orig_depth = my_dep.depth()
+#         orig_edges = glen(my_dep.edges())
+#         print(f"Original DAG: {orig_depth - 1} depth, {orig_edges} edges")
+
+#         TRIM = False
+#         my_start = time.time()
+#         my_dep._multi_graph = dag_to_dep_graph(my_dep._multi_graph, circuit_find_qubit_dict(circuit), TRIM)
+#         my_end = time.time()
+
+#         if TRIM:
+#             trim_start = time.time()
+#             trim_edges(my_dep._multi_graph)
+#             trim_end = time.time()
+#             print(f"My dependency graph: {my_dep.depth() - 1} depth, {op_edges(my_dep)} edges, {my_end - my_start:0.4f} sec + trimming for {trim_end - trim_start:0.4f} sec")
+#         else:
+#             print(f"My dependency graph: {my_dep.depth() - 1} depth, {op_edges(my_dep)} edges, {my_end - my_start:0.4f} sec")
+#         qk_start = time.time()
+#         qk_dep = Q.converters.dag_to_dagdependency(qk_dag)
+#         qk_end = time.time()
+
+#         print(f"Qiskit dependency graph: {qk_dep.depth()} depth, {glen(qk_dep.get_all_edges())} edges, {qk_end - qk_start:0.4f} sec")
+#     else:
+#         print("Pass a .qasm file as arg", out=sys.stderr)
 
 if __name__ == '__main__':
-    #cProfile.run('main(sys.argv)')
-    main(sys.argv)
+    exitcode = main(sys.argv)
+    exit(exitcode)
